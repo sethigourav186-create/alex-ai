@@ -1,0 +1,445 @@
+import torch, threading, os, requests, warnings, hashlib, time, sys, json, base64, re
+from datetime import datetime
+from contextlib import contextmanager
+from transformers import AutoTokenizer, AutoModelForCausalLM, TextIteratorStreamer
+warnings.filterwarnings("ignore")
+import logging; logging.disable(logging.CRITICAL)
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+torch.set_num_threads(os.cpu_count() or 4)
+ 
+DEBUG = True
+def dbg(*a):
+    if DEBUG: print("  [DEBUG]", *a)
+ 
+# ── OPTIONAL LIBS ──
+try: import numpy as np; NP = True
+except: NP = False
+try: import pyttsx3; TTS = True
+except: TTS = False
+try: import speech_recognition as sr; STT = True
+except: STT = False
+try: import cv2; CV = True
+except: CV = False
+CV_FACE = False
+if CV:
+    try: cv2.face.LBPHFaceRecognizer_create(); CV_FACE = True
+    except AttributeError: pass
+try: from duckduckgo_search import DDGS; DDG = True
+except:
+    try: from ddgs import DDGS; DDG = True
+    except: DDG = False
+ 
+dbg(f"numpy={NP} tts={TTS} stt={STT} cv={CV} cv_face={CV_FACE} ddg={DDG}")
+if not STT: dbg("Voice/Clap need: pip install SpeechRecognition pyaudio")
+if CV and not CV_FACE: dbg("Face Lock needs: pip uninstall opencv-python -y && pip install opencv-contrib-python")
+ 
+# ── VOICE ──
+def speak(t):
+    if not TTS: print(f"ALEX: {t}"); return
+    try:
+        e = pyttsx3.init(); e.setProperty("rate", 180); e.setProperty("volume", 1.0)
+        for v in e.getProperty("voices"):
+            if "david" in v.name.lower(): e.setProperty("voice", v.id); break
+        e.say(t); e.runAndWait()
+    except: print(f"ALEX: {t}")
+ 
+def listen(sec=6):
+    if not STT: return input("You: ").strip()
+    r = sr.Recognizer(); r.energy_threshold = 300
+    try:
+        with sr.Microphone() as s:
+            print("  [Listening...]", end="\r")
+            r.adjust_for_ambient_noise(s, duration=0.5)
+            a = r.listen(s, timeout=sec, phrase_time_limit=10)
+        t = r.recognize_google(a, language="en-IN"); print(f"You: {t}     "); return t
+    except sr.WaitTimeoutError: return ""
+    except sr.UnknownValueError: print("  [Not clear]  "); return ""
+    except: return input("You: ").strip()
+ 
+def wake():
+    if not STT: return True
+    r = sr.Recognizer()
+    try:
+        with sr.Microphone() as s:
+            print("  [Listening for wake word...]", end="\r")
+            r.adjust_for_ambient_noise(s, duration=0.5)
+            a = r.listen(s, timeout=5, phrase_time_limit=3)
+        text = r.recognize_google(a).lower()
+        dbg(f"Heard: '{text}'")
+        return any(w in text for w in ["hey alex", "alex", "ok alex"])
+    except: return False
+ 
+def clap():
+    if not STT or not NP: return False
+    r = sr.Recognizer(); cnt = 0; last = 0
+    try:
+        with sr.Microphone() as s:
+            print("  [Calibrating mic...]", end="\r")
+            r.adjust_for_ambient_noise(s, duration=1.0)
+            base = []
+            for _ in range(5):
+                try:
+                    a = r.listen(s, timeout=1, phrase_time_limit=0.3)
+                    base.append(np.abs(np.frombuffer(a.frame_data, dtype=np.int16)).mean())
+                except sr.WaitTimeoutError: continue
+            base_vol = sum(base) / len(base) if base else 100
+            thresh = max(base_vol * 1.8, base_vol + 50)
+            dbg(f"baseline={base_vol:.0f} thresh={thresh:.0f}")
+            print("  [Clap twice...]      ", end="\r")
+            end = time.time() + 10
+            while time.time() < end:
+                try:
+                    a = r.listen(s, timeout=1, phrase_time_limit=0.5)
+                    vol = np.abs(np.frombuffer(a.frame_data, dtype=np.int16)).mean()
+                    now = time.time()
+                    if vol > thresh and 0.1 < now - last < 1.0: cnt += 1
+                    if cnt >= 2: print("  [Clap detected!]     "); return True
+                    if vol > thresh: last = now
+                except sr.WaitTimeoutError: continue
+    except Exception as e: dbg(f"clap error: {e}")
+    print("  [No clap detected]")
+    return False
+ 
+# ── CAMERA HELPERS (shared by face activation + face lock) ──
+@contextmanager
+def camera():
+    cap = cv2.VideoCapture(0)
+    try: yield cap
+    finally:
+        cap.release()
+        try: cv2.destroyAllWindows()
+        except: pass
+ 
+CASCADE = None
+if CV:
+    try: CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    except: pass
+ 
+def find_face(frm):
+    gray = cv2.cvtColor(frm, cv2.COLOR_BGR2GRAY)
+    faces = CASCADE.detectMultiScale(gray, 1.1, 4, minSize=(100, 100))
+    return (gray, faces[0]) if len(faces) else (gray, None)
+ 
+def show(win, frm):
+    try:
+        cv2.imshow(win, frm)
+        return cv2.waitKey(1) & 0xFF == ord("q")
+    except: return False
+ 
+def face():
+    if not CV or CASCADE is None or CASCADE.empty(): return False
+    with camera() as cap:
+        if not cap.isOpened(): return False
+        print("  [Face scan...]", end="\r")
+        end = time.time() + 10
+        while time.time() < end:
+            ret, frm = cap.read()
+            if not ret: break
+            _, box = find_face(frm)
+            if box is not None: print("  [Face OK!]     "); return True
+            if show("ALEX Face", frm): break
+    dbg("face(): no face within 10s")
+    return False
+ 
+# ── ENCRYPTION ──
+def salt():
+    if os.path.exists(".s"): return open(".s", "rb").read()
+    s = os.urandom(32); open(".s", "wb").write(s); return s
+ 
+def mkey(pw): return hashlib.pbkdf2_hmac("sha256", pw.encode(), salt(), 480000)
+ 
+def enc(t, k):
+    tb = t.encode(); kb = (k * (len(tb) // len(k) + 1))[:len(tb)]
+    return base64.b64encode(bytes(a ^ b for a, b in zip(tb, kb))).decode()
+ 
+def dec(t, k):
+    try:
+        tb = base64.b64decode(t); kb = (k * (len(tb) // len(k) + 1))[:len(tb)]
+        return bytes(a ^ b for a, b in zip(tb, kb)).decode()
+    except: return None
+ 
+# ── PASSWORD INPUT ──
+def getpw(p):
+    print(p, end="", flush=True); pw = ""
+    try:
+        import msvcrt
+        while True:
+            c = msvcrt.getwch()
+            if c in ("\r", "\n"): break
+            elif c == "\x08":
+                if pw: pw = pw[:-1]; print("\b \b", end="", flush=True)
+            elif c == "\x03": raise KeyboardInterrupt
+            else: pw += c; print("*", end="", flush=True)
+        print()
+    except ImportError:
+        import getpass; pw = getpass.getpass("")
+    return pw
+ 
+# ── SECURITY (lockout + injection log) ──
+def chklock():
+    if not os.path.exists(".ss"): return False, 0
+    try:
+        d = json.load(open(".ss"))
+        if d.get("t", 0) >= 3:
+            w = 300 - (time.time() - d.get("ts", 0))
+            if w > 0: return True, int(w)
+            json.dump({"t": 0}, open(".ss", "w"))
+    except: pass
+    return False, 0
+ 
+def fail():
+    d = json.load(open(".ss")) if os.path.exists(".ss") else {"t": 0}
+    d["t"] = d.get("t", 0) + 1; d["ts"] = time.time()
+    json.dump(d, open(".ss", "w"))
+ 
+def ok(): json.dump({"t": 0, "ts": 0}, open(".ss", "w"))
+ 
+def log(e): open(".thr", "a").write(f"[{datetime.now():%H:%M:%S}] {e}\n")
+ 
+INJ = ["ignore previous", "forget instructions", "act as", "jailbreak",
+       "override", "system prompt", "reveal password"]
+ 
+def bad(t):
+    if any(p in t.lower() for p in INJ): log(f"INJ:{t[:50]}"); return True
+    return False
+ 
+# ── WEB DATA ──
+def search(q):
+    if not DDG: return ""
+    try:
+        with DDGS() as d:
+            return "\n".join(f"-{x['title']}:{x['body'][:100]}" for x in list(d.text(q, max_results=3)))
+    except: return ""
+ 
+def news(q):
+    if not DDG: return ""
+    try:
+        with DDGS() as d:
+            return "\n".join(f"-{x['title']}:{x.get('body','')[:100]}" for x in list(d.news(q, max_results=3)))
+    except: return ""
+ 
+def wiki(q):
+    try:
+        r = requests.get(f"https://en.wikipedia.org/api/rest_v1/page/summary/{q.replace(' ','_')}", timeout=4)
+        return r.json().get("extract", "")[:300] if r.ok else ""
+    except: return ""
+ 
+CATS = [
+    (("border","attack","war","missile","military","army","navy","nuclear"), lambda q: news(q + " 2025")),
+    (("terror","terrorist","criminal","wanted","isis"), lambda q: search(q + " latest")),
+    (("cyber","hack","malware","breach"), lambda q: news(q + " cyber")),
+    (("weapon","tank","jet","submarine","defence"), lambda q: search(q + " defence")),
+    (("china","pakistan","russia","iran","north korea"), lambda q: news(q + " military")),
+    (("news","latest","today","update"), news),
+    (("what is","who is","explain","history"), wiki),
+]
+ 
+def fetch(q):
+    t = q.lower()
+    for keys, fn in CATS:
+        if any(k in t for k in keys): return fn(q)
+    return search(q)
+ 
+# ── FACE LOCK (2nd factor) ──
+FACE_MODEL = ".face_model.yml"
+FACE_LABEL = 1
+ 
+def enroll_face():
+    if not CV_FACE:
+        print("  Need: pip uninstall opencv-python -y && pip install opencv-contrib-python")
+        return False
+    with camera() as cap:
+        if not cap.isOpened(): print("  Camera not accessible"); return False
+        print("\n  [Face Lock Setup] Look at the camera...")
+        samples = []
+        end = time.time() + 25
+        while len(samples) < 25 and time.time() < end:
+            ret, frm = cap.read()
+            if not ret: break
+            gray, box = find_face(frm)
+            if box is not None:
+                x, y, w, h = box
+                samples.append(cv2.resize(gray[y:y+h, x:x+w], (200, 200)))
+                print(f"  Captured {len(samples)}/25", end="\r")
+            if show("Enroll - q to cancel", frm): break
+            time.sleep(0.1)
+    if len(samples) < 8:
+        print("\n  Not enough samples. Face Lock NOT enabled."); return False
+    rec = cv2.face.LBPHFaceRecognizer_create()
+    rec.train(samples, np.array([FACE_LABEL] * len(samples)))
+    rec.save(FACE_MODEL)
+    print(f"\n  Enrolled {len(samples)} samples. Face Lock ENABLED.\n")
+    return True
+ 
+def verify_face(attempts=3):
+    if not os.path.exists(FACE_MODEL): return True
+    if not CV_FACE: print("  opencv-contrib missing, skipping face check"); return True
+    rec = cv2.face.LBPHFaceRecognizer_create(); rec.read(FACE_MODEL)
+    for a in range(attempts):
+        with camera() as cap:
+            if not cap.isOpened(): print("  Camera not accessible"); return False
+            print(f"  Verifying face... ({a+1}/{attempts})", end="\r")
+            end = time.time() + 8; matched = False
+            while time.time() < end:
+                ret, frm = cap.read()
+                if not ret: break
+                gray, box = find_face(frm)
+                if box is not None:
+                    x, y, w, h = box
+                    label, conf = rec.predict(cv2.resize(gray[y:y+h, x:x+w], (200, 200)))
+                    dbg(f"conf={conf:.1f} (<70=match)")
+                    if label == FACE_LABEL and conf < 70: matched = True; break
+                if show("Verify - q to cancel", frm): break
+        if matched: print("  Face verified ✅"); return True
+        print(f"  Not recognized. {attempts-a-1} left.")
+    return False
+ 
+# ── LOGIN ──
+def login():
+    print("=" * 48 + "\n  ALEX — DEFENCE AI [CLASSIFIED]\n" + "=" * 48)
+    bl, w = chklock()
+    if bl: print(f"  LOCKED {w // 60}m {w % 60}s"); sys.exit(1)
+ 
+    if not os.path.exists(".au"):
+        print("\n  Set password (* per key)\n")
+        while True:
+            pw = getpw("  Create : ")
+            if len(pw) < 4: print("  Min 4!"); continue
+            if getpw("  Confirm: ") != pw: print("  No match!\n"); continue
+            break
+        ky = mkey(pw); open(".au", "w").write(enc("OK", ky))
+        print("  Password set!\n")
+        if CV_FACE and input("  Enable Face Lock (Password + Face)? (y/n): ").strip().lower() == "y":
+            enroll_face()
+        elif CV:
+            print("  Face Lock needs opencv-contrib-python\n")
+        return ky
+ 
+    print("\n  Enter password\n")
+    for i in range(3):
+        pw = getpw(f"  Pass ({i+1}/3): "); ky = mkey(pw)
+        if dec(open(".au").read().strip(), ky) == "OK":
+            if os.path.exists(FACE_MODEL):
+                print("\n  Password OK. Step 2: Face verification.\n")
+                if verify_face(): ok(); print("  ACCESS GRANTED (Password + Face).\n"); return ky
+                fail(); print("  Face verification FAILED. Access denied."); sys.exit(1)
+            ok(); print("  GRANTED.\n"); return ky
+        fail()
+        if i < 2: print(f"  Wrong! {2-i} left.\n")
+        else: print("  LOCKED."); sys.exit(1)
+ 
+# ── MAIN ──
+MODEL = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+SYS = f"""You are ALEX, a military intelligence AI. Today: {datetime.now():%B %d %Y}.
+STRICT OUTPUT RULES:
+- Reply in 1-2 short sentences ONLY.
+- Give facts, numbers, dates. No stories.
+- NEVER write code, lists, or ask questions.
+- NEVER continue user's sentence or invent scenarios.
+- If you don't know, say: Insufficient data.
+- No greetings. No filler words. Direct military answers only."""
+ 
+def main():
+    ky = login()
+    print("  Activation: [1]Voice [2]Clap [3]Face [4]Type")
+    mode = input("  Choose: ").strip()
+    print("  Loading model (this may take a minute)...")
+    tok = AutoTokenizer.from_pretrained(MODEL, use_fast=True)
+    if not tok.pad_token: tok.pad_token = tok.eos_token
+    mdl = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=torch.float32, low_cpu_mem_usage=True)
+    mdl.eval()
+    speak("ALEX online. Ready Commander.")
+    print("  READY! quit=exit\n" + "-" * 48 + "\n")
+    hist = [{"role": "system", "content": SYS}]
+ 
+    def ask_after(trigger):
+        """After wake/clap/face triggers, give 3 chances to be heard."""
+        if not trigger(): return ""
+        speak("Yes?")
+        for i in range(3):
+            t = listen()
+            if t: return t
+            if i < 2: print("  [Didn't catch that]"); speak("Say again?")
+        return ""
+ 
+    def inp():
+        if mode == "1":
+            while True:
+                t = ask_after(wake)
+                if t: return t
+        elif mode == "2": return ask_after(clap)
+        elif mode == "3": return ask_after(face)
+        else: return input("You: ").strip()
+ 
+    def chat(u):
+        if bad(u): speak("Blocked."); return
+        print("  [Intel...]", end="\r"); data = fetch(u)
+        hist.append({"role": "user", "content": f"Data:{data}\nQ:{u}\nAnswer:" if data else u})
+        prompt = tok.apply_chat_template(hist, tokenize=False, add_generation_prompt=True)
+        inputs = tok(prompt, return_tensors="pt", truncation=True, max_length=2048)
+        st = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True)
+        threading.Thread(target=mdl.generate, kwargs={
+            **inputs, "streamer": st, "max_new_tokens": 60, "do_sample": False,
+            "top_p": 1.0, "no_repeat_ngram_size": 4, "repetition_penalty": 1.3,
+            "use_cache": True, "pad_token_id": tok.eos_token_id
+        }).start()
+        print("           ", end="\r"); print("ALEX: ", end="", flush=True)
+        rep = ""
+        for t in st: print(t, end="", flush=True); rep += t
+        rep = rep.strip()
+        for stop in ["\n\n", "```", "def ", "import ", "class ", "Sure!", "Here's", "Certainly"]:
+            if stop in rep: rep = rep[:rep.index(stop)].strip(); break
+        rep = " ".join(re.split(r'(?<=[.!?])\s+', rep)[:2]).strip() or "Insufficient data."
+        print("\n"); speak(rep[:250])
+        hist.append({"role": "assistant", "content": rep})
+ 
+    def changepass():
+        print("\n  [Password Change]\n")
+        old_ky = mkey(getpw("  Current password: "))
+        if dec(open(".au").read().strip(), old_ky) != "OK":
+            print("  Wrong password! Aborted.\n"); return None
+        while True:
+            new_pw = getpw("  New password   : ")
+            if len(new_pw) < 4: print("  Min 4 chars!"); continue
+            if getpw("  Confirm new    : ") != new_pw: print("  No match!\n"); continue
+            break
+        new_ky = mkey(new_pw)
+        open(".au", "w").write(enc("OK", new_ky))
+        print("  Password changed!\n"); speak("Password updated Commander.")
+        return new_ky
+ 
+    def facelock_menu():
+        print("\n  [Face Lock]")
+        if os.path.exists(FACE_MODEL):
+            print("  Status: ENABLED")
+            print("  [1] Re-enroll   [2] Disable   [Enter] Cancel")
+            c = input("  Choose: ").strip()
+            if c == "1" and CV_FACE: enroll_face()
+            elif c == "1": print("  opencv-contrib-python required.\n")
+            elif c == "2": os.remove(FACE_MODEL); print("  Face Lock disabled.\n")
+        else:
+            print("  Status: DISABLED")
+            if CV_FACE:
+                if input("  Enable now? (y/n): ").strip().lower() == "y": enroll_face()
+            else:
+                print("  Needs: pip uninstall opencv-python -y && pip install opencv-contrib-python\n")
+ 
+    while True:
+        try: u = inp()
+        except (KeyboardInterrupt, EOFError): break
+        if not u: continue
+        cmd = u.lower()
+        if cmd in ("quit", "exit", "stop"): speak("Session ended."); break
+        elif cmd == "/clear":
+            hist.clear(); hist.append({"role": "system", "content": SYS}); speak("Cleared.")
+        elif cmd == "/changepass":
+            new_ky = changepass()
+            if new_ky: ky = new_ky
+        elif cmd == "/facelock":
+            facelock_menu()
+        else:
+            chat(u)
+ 
+if __name__ == "__main__": main()
+ 
